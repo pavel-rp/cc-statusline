@@ -12,8 +12,8 @@ Two lines, an *instrument panel*:
 
 - **Line 1** — folder · git branch · model · effort · **live subagent model(s)**
 - **Line 2** — a context gauge that shifts **green → amber → red** as the window
-  fills, cumulative session tokens, cost, 5h/7d rate-limit dot-meters
-  (`◔◑◕●`, colored by fill), and lines changed.
+  fills, cumulative session tokens (**main loop + every subagent**), cost, 5h/7d
+  rate-limit dot-meters (`◔◑◕●`, colored by fill), and lines changed.
 
 Every field degrades gracefully — absent input fields are simply omitted.
 
@@ -35,6 +35,16 @@ covers background agents, whose `tool_result` returns immediately — or when th
 signal keeps a foreground agent on screen while it sits inside a slow tool call.
 
 Concurrent agents collapse by model: `Sonnet 5`, `2× Sonnet 5`, `Sonnet 5, Haiku 4.5`.
+
+Those same transcripts are what makes the **token count whole**. Claude Code no
+longer folds subagent usage into the main transcript, so a status line reading
+only `<sessionId>.jsonl` silently undercounts every fan-out — in one session here
+a Haiku fan-out was 29% of the total burn. Each transcript is scanned
+incrementally (cached byte offset + running total + last-seen model, keyed by
+session), so a render parses only the bytes appended since the previous one, and
+a finished agent costs one `stat()` forever after. Lines are pre-filtered by
+substring before `JSON.parse`, which keeps even a cold cache cheap: ~13 MB of
+transcripts parses in ~70 ms.
 
 Note this only refreshes as often as Claude Code re-renders the status line — the
 field is as live as the rest of the panel, not more.

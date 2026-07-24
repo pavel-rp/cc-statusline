@@ -104,76 +104,88 @@ function readBranch(startDir) {
 }
 const branch = readBranch(cwd);
 
-// ---------- cumulative session tokens (incremental transcript parse) ----------
-// Caches a byte offset + running totals per session so each render only reads
-// the bytes appended since last time. Counts the main loop only — subagents get
-// their own transcripts under <session>/subagents/ (see below).
-// The same pass tracks in-flight Task/Agent tool_use ids (recorded, then dropped
-// when their tool_result lands) so a foreground subagent stays "live" even while
-// it sits inside a long tool call and appends nothing.
+// ---------- session tokens + live subagents (one incremental pass) ----------
+// Each transcript is read incrementally: a byte offset, a running token total
+// and the last-seen model are cached per session, so a render only parses the
+// bytes appended since the previous one. A finished agent's transcript stops
+// growing and costs a single stat() forever after.
+//
+// The main transcript covers the main loop; every agent-<id>.jsonl under
+// <sessionId>/subagents/ adds its own burn. Claude Code no longer folds subagent
+// usage into the main transcript, so counting these is the only way the panel
+// reflects everything spent — a Haiku fan-out was ~29% of one session's tokens.
+// (No double count: the only main-transcript lines that mention an agent are its
+// toolUseResult, which carries no usage block.)
+//
+// The main pass also tracks in-flight Task/Agent tool_use ids — recorded when
+// the call appears, dropped when its tool_result lands — so a foreground
+// subagent stays "live" while parked inside a long tool call, appending nothing.
 function fmtTokens(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(n);
 }
-let totalTokens = 0;
-let pendingAgents = {}; // tool_use id -> 1, for Task/Agent calls without a result yet
-try {
-  if (transcriptPath && fs.existsSync(transcriptPath)) {
-    const cachedir = path.join(os.tmpdir(), 'claude-statusline-cache');
-    try { fs.mkdirSync(cachedir, { recursive: true }); } catch (e) {}
-    const cacheFile = path.join(cachedir, 'tokens-' + sessionId + '.json');
-    const stat = fs.statSync(transcriptPath);
-    let totals = { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 };
-    let offset = 0, remainder = '';
-    let cache = null;
-    try { cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch (e) { cache = null; }
-    if (cache && typeof cache.offset === 'number' && cache.offset <= stat.size) {
-      totals = cache.totals || totals;
-      offset = cache.offset;
-      remainder = cache.remainder || '';
-      if (cache.pending && typeof cache.pending === 'object') pendingAgents = cache.pending;
+
+const CACHE_DIR = path.join(os.tmpdir(), 'claude-statusline-cache');
+const CACHE_FILE = path.join(CACHE_DIR, 'tokens-' + sessionId + '.json');
+
+// Parse whatever is new in a JSONL transcript. prev and the return value are
+// {offset, tokens, remainder, model}; `pending`, when passed, collects Task/Agent
+// tool_use ids. Lines are pre-filtered by substring: transcripts are mostly bulky
+// attachment and tool_result lines that can never carry usage, and skipping
+// JSON.parse on those is what keeps the first parse of a cold cache cheap.
+function scanUsage(file, size, prev, pending) {
+  let tokens = 0, offset = 0, remainder = '', model = '';
+  if (prev && typeof prev.offset === 'number' && prev.offset <= size) {
+    offset = prev.offset;
+    remainder = typeof prev.remainder === 'string' ? prev.remainder : '';
+    model = typeof prev.model === 'string' ? prev.model : '';
+    if (typeof prev.tokens === 'number') tokens = prev.tokens;
+    else if (prev.totals) { // cache from before this tracked a single total
+      const t = prev.totals;
+      tokens = (t.input || 0) + (t.output || 0) + (t.cacheCreate || 0) + (t.cacheRead || 0);
     }
-    if (offset < stat.size) {
-      const fd = fs.openSync(transcriptPath, 'r');
-      const len = stat.size - offset;
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, offset);
-      fs.closeSync(fd);
-      const chunk = remainder + buf.toString('utf8');
-      const lastNl = chunk.lastIndexOf('\n');
-      let toParse = '', newRem = chunk;
-      if (lastNl !== -1) { toParse = chunk.slice(0, lastNl); newRem = chunk.slice(lastNl + 1); }
-      for (const line of toParse.split('\n')) {
-        if (!line) continue;
-        let obj;
-        try { obj = JSON.parse(line); } catch (e) { continue; }
-        const msg = obj && obj.message;
-        const u = msg && msg.usage;
-        if (u) {
-          totals.input += u.input_tokens || 0;
-          totals.output += u.output_tokens || 0;
-          totals.cacheCreate += u.cache_creation_input_tokens || 0;
-          totals.cacheRead += u.cache_read_input_tokens || 0;
-        }
-        const content = msg && msg.content;
-        if (Array.isArray(content)) {
-          for (const b of content) {
-            if (!b || typeof b !== 'object') continue;
-            if (b.type === 'tool_use' && (b.name === 'Task' || b.name === 'Agent') && b.id) pendingAgents[b.id] = 1;
-            else if (b.type === 'tool_result' && b.tool_use_id) delete pendingAgents[b.tool_use_id];
-          }
-        }
-      }
-      try {
-        fs.writeFileSync(cacheFile, JSON.stringify({
-          offset: stat.size - newRem.length, totals, remainder: newRem, pending: pendingAgents,
-        }));
-      } catch (e) {}
-    }
-    totalTokens = totals.input + totals.output + totals.cacheCreate + totals.cacheRead;
   }
-} catch (e) { totalTokens = 0; }
+  if (offset >= size) return { offset: offset, tokens: tokens, remainder: remainder, model: model };
+  let chunk;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(size - offset);
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    chunk = remainder + buf.toString('utf8');
+  } finally { fs.closeSync(fd); }
+  const lastNl = chunk.lastIndexOf('\n');
+  let toParse = '', newRem = chunk;
+  if (lastNl !== -1) { toParse = chunk.slice(0, lastNl); newRem = chunk.slice(lastNl + 1); }
+  for (const line of toParse.split('\n')) {
+    if (!line) continue;
+    const mayTool = !!pending &&
+      (line.indexOf('"tool_use"') !== -1 || line.indexOf('"tool_result"') !== -1);
+    if (!mayTool && line.indexOf('"usage"') === -1 && line.indexOf('"model"') === -1) continue;
+    let obj;
+    try { obj = JSON.parse(line); } catch (e) { continue; }
+    const msg = obj && obj.message;
+    if (!msg || typeof msg !== 'object') continue;
+    const u = msg.usage;
+    if (u) {
+      tokens += (u.input_tokens || 0) + (u.output_tokens || 0) +
+                (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+    }
+    if (obj.type === 'assistant' && msg.model && msg.model !== '<synthetic>') model = msg.model;
+    if (pending && Array.isArray(msg.content)) {
+      for (const b of msg.content) {
+        if (!b || typeof b !== 'object') continue;
+        if (b.type === 'tool_use' && (b.name === 'Task' || b.name === 'Agent') && b.id) pending[b.id] = 1;
+        else if (b.type === 'tool_result' && b.tool_use_id) delete pending[b.tool_use_id];
+      }
+    }
+  }
+  // Offset advances to EOF and the unparsed tail is carried in `remainder`.
+  // Rewinding the offset over that tail instead (size - remainder length) would
+  // re-read the same bytes AND prepend the cached copy, doubling the partial
+  // line on every render until the offset walked backwards into counted lines.
+  return { offset: size, tokens: tokens, remainder: newRem, model: model };
+}
 
 // ---------- active subagent model(s) ----------
 // The status line hook is session-level: the input JSON's model is always the
@@ -185,41 +197,11 @@ try {
 // seconds (covers background agents, whose tool_result returns immediately) or
 // if the Task/Agent tool_use that spawned it has no tool_result yet (covers a
 // foreground agent parked inside a slow tool call). Still zero subprocesses:
-// one readdir, a stat per agent file, and a 64K tail read per live agent.
+// one readdir plus a stat per agent file.
 const FRESH_MS = 10000;
 // A pending tool_use can outlive its agent (interrupt, crash, compaction never
 // writes the tool_result), so cap how long that keeps an idle agent on screen.
 const PENDING_MAX_MS = 600000;
-const TAIL_BYTES = 65536;
-
-function readTail(file, size) {
-  const start = Math.max(0, size - TAIL_BYTES);
-  const len = size - start;
-  if (len <= 0) return '';
-  const fd = fs.openSync(file, 'r');
-  try {
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, start);
-    const txt = buf.toString('utf8');
-    return start > 0 ? txt.slice(txt.indexOf('\n') + 1) : txt;
-  } finally { fs.closeSync(fd); }
-}
-
-// Last model this agent actually ran on — read backwards, newest line wins.
-function lastModelOf(file, size) {
-  let tail = '';
-  try { tail = readTail(file, size); } catch (e) { return ''; }
-  const lines = tail.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (!line || line.indexOf('"model"') === -1) continue;
-    let obj;
-    try { obj = JSON.parse(line); } catch (e) { continue; }
-    const m = obj && obj.type === 'assistant' && obj.message && obj.message.model;
-    if (m && m !== '<synthetic>') return m;
-  }
-  return '';
-}
 
 function readMeta(jsonlFile) {
   try {
@@ -245,34 +227,46 @@ function modelLabel(id) {
   return s.length > 20 ? s.slice(0, 19) + '…' : s;
 }
 
-function activeSubagentModels() {
+// One walk of <sessionId>/subagents/: sums every agent's burn (finished ones
+// included, so the token figure covers the whole session) and collects the
+// models of the ones still running. Fills outAgents with the fresh cache entries.
+function scanSubagents(prevAgents, outAgents, pending) {
+  const res = { tokens: 0, labels: [] };
   const dir = path.join(path.dirname(transcriptPath), sessionId, 'subagents');
   let names;
-  try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  try { names = fs.readdirSync(dir); } catch (e) { return res; }
   const now = Date.now();
-  const hasPending = Object.keys(pendingAgents).length > 0;
-  const labels = [];
+  const hasPending = Object.keys(pending).length > 0;
   for (const name of names) {
     if (!/^agent-.+\.jsonl$/.test(name)) continue;
     const file = path.join(dir, name);
     let st;
     try { st = fs.statSync(file); } catch (e) { continue; }
+    let scan = null;
+    try { scan = scanUsage(file, st.size, prevAgents[name], null); }
+    catch (e) { scan = prevAgents[name] || null; } // keep the cached count
+    if (scan) {
+      outAgents[name] = scan;
+      res.tokens += scan.tokens || 0;
+    }
     const age = now - st.mtimeMs;
-    const live = age < FRESH_MS;
     let meta = null;
-    if (!live) {
+    if (age >= FRESH_MS) {
       if (!hasPending || age >= PENDING_MAX_MS) continue;
       meta = readMeta(file);
-      if (!(meta && meta.toolUseId && pendingAgents[meta.toolUseId])) continue;
+      if (!(meta && meta.toolUseId && pending[meta.toolUseId])) continue;
     }
     // The transcript wins — it carries the resolved id (Haiku 4.5). meta.json's
     // alias only covers the window between spawn and the first assistant line,
     // when the transcript has no model in it yet.
-    let label = modelLabel(lastModelOf(file, st.size));
-    if (!label) label = modelLabel(meta ? meta.model : (meta = readMeta(file)) && meta.model);
-    if (label) labels.push(label);
+    let label = modelLabel(scan && scan.model);
+    if (!label) {
+      if (!meta) meta = readMeta(file);
+      label = modelLabel(meta && meta.model);
+    }
+    if (label) res.labels.push(label);
   }
-  return labels;
+  return res;
 }
 
 // Collapse to "Sonnet 5" / "2× Sonnet 5" / "Sonnet 5, Haiku 4.5".
@@ -285,8 +279,38 @@ function summarizeSubagents(labels) {
   return order.map(l => (counts.get(l) > 1 ? counts.get(l) + '× ' : '') + l).join(', ');
 }
 
+let totalTokens = 0;
 let subModels = '';
-try { subModels = summarizeSubagents(activeSubagentModels()); } catch (e) { subModels = ''; }
+try {
+  if (transcriptPath && fs.existsSync(transcriptPath)) {
+    let rawCache = '';
+    try { rawCache = fs.readFileSync(CACHE_FILE, 'utf8'); } catch (e) { rawCache = ''; }
+    let cache = null;
+    try { cache = JSON.parse(rawCache); } catch (e) { cache = null; }
+    if (!cache || typeof cache !== 'object') cache = {};
+    const pending = (cache.pending && typeof cache.pending === 'object') ? cache.pending : {};
+    const prevAgents = (cache.agents && typeof cache.agents === 'object') ? cache.agents : {};
+    // Older versions wrote {offset, totals, remainder} at the top level rather
+    // than under `main`, and rewound the offset over the trailing partial line
+    // instead of carrying it — so take their offset but drop their remainder,
+    // or that line would be counted from disk and from the cache both.
+    const legacyMain = { offset: cache.offset, totals: cache.totals, remainder: '' };
+    const main = scanUsage(transcriptPath, fs.statSync(transcriptPath).size, cache.main || legacyMain, pending);
+    const agents = {};
+    const subs = scanSubagents(prevAgents, agents, pending);
+    totalTokens = main.tokens + subs.tokens;
+    subModels = summarizeSubagents(subs.labels);
+    // Only write when something actually moved — a render fires every few
+    // hundred ms, and rewriting an unchanged cache is pure disk churn.
+    const next = JSON.stringify({ main: main, agents: agents, pending: pending });
+    if (next !== rawCache) {
+      try {
+        fs.mkdirSync(CACHE_DIR, { recursive: true });
+        fs.writeFileSync(CACHE_FILE, next);
+      } catch (e) {}
+    }
+  }
+} catch (e) { /* keep whatever was computed before the failure */ }
 
 // ---------- gauges ----------
 function bar(pct, width) {
