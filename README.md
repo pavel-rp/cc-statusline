@@ -6,16 +6,38 @@ one zero-subprocess Node script shared across Windows, WSL, and a Docker sandbox
 Two lines, an *instrument panel*:
 
 ```
- second-memory    chore/track-durable-research-docs   Opus · high
+ second-memory    chore/track-durable-research-docs   Opus · high ⇢ 2× Sonnet 5
 ▓▓▓▓▓▓░░░ 72%   1.2M   $3.40   5h ◔ 24%  7d ◑ 41%   +156/-23
 ```
 
-- **Line 1** — folder · git branch · model · effort
+- **Line 1** — folder · git branch · model · effort · **live subagent model(s)**
 - **Line 2** — a context gauge that shifts **green → amber → red** as the window
   fills, cumulative session tokens, cost, 5h/7d rate-limit dot-meters
   (`◔◑◕●`, colored by fill), and lines changed.
 
 Every field degrades gracefully — absent input fields are simply omitted.
+
+## Subagent models (`⇢`)
+
+Claude's status JSON is session-level: its `model` is always the **main loop's**,
+even while a Sonnet or Haiku subagent is doing the work. The `⇢` field is derived
+instead from the subagent transcripts Claude Code writes per session:
+
+```
+<project>/<sessionId>/subagents/agent-<id>.jsonl      # assistant lines carry message.model
+<project>/<sessionId>/subagents/agent-<id>.meta.json  # {agentType, toolUseId, spawnDepth}
+```
+
+An agent is *live* when its transcript was appended to in the last 10s — which
+covers background agents, whose `tool_result` returns immediately — or when the
+`Task`/`Agent` `tool_use` that spawned it still has no `tool_result` (capped at
+10 min, so an interrupted agent can't pin a phantom on the line). That second
+signal keeps a foreground agent on screen while it sits inside a slow tool call.
+
+Concurrent agents collapse by model: `Sonnet 5`, `2× Sonnet 5`, `Sonnet 5, Haiku 4.5`.
+
+Note this only refreshes as often as Claude Code re-renders the status line — the
+field is as live as the rest of the panel, not more.
 
 ## Why a repo
 

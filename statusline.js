@@ -11,7 +11,7 @@
 //   * Truecolor (24-bit) — WezTerm renders it, and its bundled Nerd Font
 //     fallback covers the powerline/git glyphs used below.
 //
-// Line 1:  <dir>   <branch>   <Model> · <effort>
+// Line 1:  <dir>   <branch>   <Model> · <effort> [⇢ <active subagent model(s)>]
 // Line 2:  <ctx bar> %   <session tokens>   $<cost>   5h <meter>%  7d <meter>%   +added/-removed
 //
 // Every field degrades gracefully — absent input JSON fields are simply omitted.
@@ -34,6 +34,7 @@ const C = {
   dir:    fg(229, 192, 123), // amber
   branch: fg(86, 182, 194),  // teal
   model:  fg(198, 120, 221), // violet
+  sub:    fg(97, 175, 239),  // blue — subagent model
   tokens: fg(127, 132, 142), // grey
   cost:   fg(152, 195, 121), // green
   add:    fg(152, 195, 121), // green
@@ -105,13 +106,18 @@ const branch = readBranch(cwd);
 
 // ---------- cumulative session tokens (incremental transcript parse) ----------
 // Caches a byte offset + running totals per session so each render only reads
-// the bytes appended since last time. Includes subagent/Task usage (same file).
+// the bytes appended since last time. Counts the main loop only — subagents get
+// their own transcripts under <session>/subagents/ (see below).
+// The same pass tracks in-flight Task/Agent tool_use ids (recorded, then dropped
+// when their tool_result lands) so a foreground subagent stays "live" even while
+// it sits inside a long tool call and appends nothing.
 function fmtTokens(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return String(n);
 }
 let totalTokens = 0;
+let pendingAgents = {}; // tool_use id -> 1, for Task/Agent calls without a result yet
 try {
   if (transcriptPath && fs.existsSync(transcriptPath)) {
     const cachedir = path.join(os.tmpdir(), 'claude-statusline-cache');
@@ -126,6 +132,7 @@ try {
       totals = cache.totals || totals;
       offset = cache.offset;
       remainder = cache.remainder || '';
+      if (cache.pending && typeof cache.pending === 'object') pendingAgents = cache.pending;
     }
     if (offset < stat.size) {
       const fd = fs.openSync(transcriptPath, 'r');
@@ -141,21 +148,145 @@ try {
         if (!line) continue;
         let obj;
         try { obj = JSON.parse(line); } catch (e) { continue; }
-        const u = obj && obj.message && obj.message.usage;
+        const msg = obj && obj.message;
+        const u = msg && msg.usage;
         if (u) {
           totals.input += u.input_tokens || 0;
           totals.output += u.output_tokens || 0;
           totals.cacheCreate += u.cache_creation_input_tokens || 0;
           totals.cacheRead += u.cache_read_input_tokens || 0;
         }
+        const content = msg && msg.content;
+        if (Array.isArray(content)) {
+          for (const b of content) {
+            if (!b || typeof b !== 'object') continue;
+            if (b.type === 'tool_use' && (b.name === 'Task' || b.name === 'Agent') && b.id) pendingAgents[b.id] = 1;
+            else if (b.type === 'tool_result' && b.tool_use_id) delete pendingAgents[b.tool_use_id];
+          }
+        }
       }
       try {
-        fs.writeFileSync(cacheFile, JSON.stringify({ offset: stat.size - newRem.length, totals, remainder: newRem }));
+        fs.writeFileSync(cacheFile, JSON.stringify({
+          offset: stat.size - newRem.length, totals, remainder: newRem, pending: pendingAgents,
+        }));
       } catch (e) {}
     }
     totalTokens = totals.input + totals.output + totals.cacheCreate + totals.cacheRead;
   }
 } catch (e) { totalTokens = 0; }
+
+// ---------- active subagent model(s) ----------
+// The status line hook is session-level: the input JSON's model is always the
+// MAIN loop's, never the subagent's. But every subagent writes its own
+// transcript next to the session's:
+//   <project>/<sessionId>/subagents/agent-<id>.jsonl   (assistant lines carry message.model)
+//   <project>/<sessionId>/subagents/agent-<id>.meta.json  {agentType, toolUseId, spawnDepth}
+// An agent counts as live if its transcript was appended to in the last few
+// seconds (covers background agents, whose tool_result returns immediately) or
+// if the Task/Agent tool_use that spawned it has no tool_result yet (covers a
+// foreground agent parked inside a slow tool call). Still zero subprocesses:
+// one readdir, a stat per agent file, and a 64K tail read per live agent.
+const FRESH_MS = 10000;
+// A pending tool_use can outlive its agent (interrupt, crash, compaction never
+// writes the tool_result), so cap how long that keeps an idle agent on screen.
+const PENDING_MAX_MS = 600000;
+const TAIL_BYTES = 65536;
+
+function readTail(file, size) {
+  const start = Math.max(0, size - TAIL_BYTES);
+  const len = size - start;
+  if (len <= 0) return '';
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    const txt = buf.toString('utf8');
+    return start > 0 ? txt.slice(txt.indexOf('\n') + 1) : txt;
+  } finally { fs.closeSync(fd); }
+}
+
+// Last model this agent actually ran on — read backwards, newest line wins.
+function lastModelOf(file, size) {
+  let tail = '';
+  try { tail = readTail(file, size); } catch (e) { return ''; }
+  const lines = tail.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || line.indexOf('"model"') === -1) continue;
+    let obj;
+    try { obj = JSON.parse(line); } catch (e) { continue; }
+    const m = obj && obj.type === 'assistant' && obj.message && obj.message.model;
+    if (m && m !== '<synthetic>') return m;
+  }
+  return '';
+}
+
+function readMeta(jsonlFile) {
+  try {
+    return JSON.parse(fs.readFileSync(jsonlFile.replace(/\.jsonl$/, '.meta.json'), 'utf8'));
+  } catch (e) { return null; }
+}
+
+// claude-sonnet-5 -> Sonnet 5 · claude-haiku-4-5-20251001 -> Haiku 4.5
+// claude-opus-5[1m] -> Opus 5 · claude-3-5-sonnet-20241022 -> Sonnet 3.5
+// bare alias "haiku" -> Haiku (meta.json records the requested alias, not the
+// resolved id). An unrecognized id passes through, but stripped of control
+// characters and clipped — this string is interpolated straight into an ANSI
+// line, so a stray \x1b or newline there would corrupt the panel.
+function cap(w) { return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase(); }
+function modelLabel(id) {
+  const s = String(id == null ? '' : id).replace(/[\x00-\x1f\x7f]/g, '');
+  if (!s) return '';
+  if (/^(opus|sonnet|haiku|fable)$/i.test(s)) return cap(s);
+  const m = s.match(/^(?:[\w.]+\.)?claude-(opus|sonnet|haiku|fable)-(\d+)(?:[-.](\d+))?/i);
+  if (m) return cap(m[1]) + ' ' + m[2] + (m[3] ? '.' + m[3] : '');
+  const legacy = s.match(/^(?:[\w.]+\.)?claude-(\d+)-(\d+)-(opus|sonnet|haiku)/i);
+  if (legacy) return cap(legacy[3]) + ' ' + legacy[1] + '.' + legacy[2];
+  return s.length > 20 ? s.slice(0, 19) + '…' : s;
+}
+
+function activeSubagentModels() {
+  const dir = path.join(path.dirname(transcriptPath), sessionId, 'subagents');
+  let names;
+  try { names = fs.readdirSync(dir); } catch (e) { return []; }
+  const now = Date.now();
+  const hasPending = Object.keys(pendingAgents).length > 0;
+  const labels = [];
+  for (const name of names) {
+    if (!/^agent-.+\.jsonl$/.test(name)) continue;
+    const file = path.join(dir, name);
+    let st;
+    try { st = fs.statSync(file); } catch (e) { continue; }
+    const age = now - st.mtimeMs;
+    const live = age < FRESH_MS;
+    let meta = null;
+    if (!live) {
+      if (!hasPending || age >= PENDING_MAX_MS) continue;
+      meta = readMeta(file);
+      if (!(meta && meta.toolUseId && pendingAgents[meta.toolUseId])) continue;
+    }
+    // The transcript wins — it carries the resolved id (Haiku 4.5). meta.json's
+    // alias only covers the window between spawn and the first assistant line,
+    // when the transcript has no model in it yet.
+    let label = modelLabel(lastModelOf(file, st.size));
+    if (!label) label = modelLabel(meta ? meta.model : (meta = readMeta(file)) && meta.model);
+    if (label) labels.push(label);
+  }
+  return labels;
+}
+
+// Collapse to "Sonnet 5" / "2× Sonnet 5" / "Sonnet 5, Haiku 4.5".
+function summarizeSubagents(labels) {
+  const order = [], counts = new Map();
+  for (const l of labels) {
+    if (!counts.has(l)) { counts.set(l, 0); order.push(l); }
+    counts.set(l, counts.get(l) + 1);
+  }
+  return order.map(l => (counts.get(l) > 1 ? counts.get(l) + '× ' : '') + l).join(', ');
+}
+
+let subModels = '';
+try { subModels = summarizeSubagents(activeSubagentModels()); } catch (e) { subModels = ''; }
 
 // ---------- gauges ----------
 function bar(pct, width) {
@@ -187,6 +318,7 @@ if (branch) l1.push(`${C.branch}${ICON_BRANCH} ${branch}${RESET}`);
 let ms = '';
 if (model) ms += `${C.model}${model}${RESET}`;
 if (effort) ms += `${C.sep} · ${RESET}${C.muted}${effort}${RESET}`;
+if (subModels) ms += `${C.sep} ⇢ ${RESET}${C.sub}${subModels}${RESET}`;
 if (ms) l1.push(ms);
 const line1 = l1.join('   ');
 
