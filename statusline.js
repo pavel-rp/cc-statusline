@@ -43,12 +43,16 @@ const C = {
   muted:  fg(127, 132, 142), // dim label
 };
 
-// gauge/heat color by percent USED (green -> amber -> red)
+// gauge/heat color by percent USED — a continuous gradient, bright green at 0%
+// through yellow at 50% to bright red at 100%. That is a hue sweep 120° -> 0°
+// at full saturation, which at 50% lightness reduces to ramping red up over the
+// first half and green down over the second, so no HSL conversion is needed.
 function heat(pct) {
   if (pct == null) return C.muted;
-  if (pct < 50) return fg(152, 195, 121); // green
-  if (pct < 80) return fg(229, 192, 123); // amber
-  return fg(224, 108, 117);               // red
+  const t = Math.max(0, Math.min(100, pct)) / 100;
+  const r = Math.round(255 * Math.min(1, 2 * t));
+  const g = Math.round(255 * Math.min(1, 2 - 2 * t));
+  return fg(r, g, 0);
 }
 
 // ---------- fields ----------

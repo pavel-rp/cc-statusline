@@ -11,7 +11,7 @@ Two lines, an *instrument panel*:
 ```
 
 - **Line 1** — folder · git branch · model · effort · **live subagent model(s)**
-- **Line 2** — a context gauge that shifts **green → amber → red** as the window
+- **Line 2** — a context gauge that sweeps **green → yellow → red** as the window
   fills, cumulative session tokens (**main loop + every subagent**), cost, 5h/7d
   rate-limit dot-meters (`◔◑◕●`, colored by fill), and lines changed.
 
